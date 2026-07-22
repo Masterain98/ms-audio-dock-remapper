@@ -1,0 +1,149 @@
+name: Manual Windows Release
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: manual-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build files
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --version=6.7.1 --yes --no-progress --allow-downgrade
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Calculate release tag
+        id: version
+        shell: pwsh
+        run: |
+          git fetch --tags --force
+
+          $chinaTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById('China Standard Time')
+          $releaseDate = [System.TimeZoneInfo]::ConvertTime([DateTimeOffset]::UtcNow, $chinaTimeZone).ToString('yyyy.MM.dd')
+          $tagPattern = '^' + [regex]::Escape($releaseDate) + '\.(\d+)$'
+          $latestCounter = -1
+
+          git tag --list "$releaseDate.*" | ForEach-Object {
+            if ($_ -match $tagPattern) {
+              $counter = [int]$Matches[1]
+              if ($counter -gt $latestCounter) {
+                $latestCounter = $counter
+              }
+            }
+          }
+
+          $tag = "$releaseDate.$($latestCounter + 1)"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "Release tag: $tag" | Write-Host
+
+      - name: Package portable release
+        id: portable
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          $stageDirectory = Join-Path $env:RUNNER_TEMP 'ms-audio-dock-remapper-portable'
+          $distDirectory = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $portablePath = Join-Path $distDirectory "MS-Audio-Dock-Remapper-$tag-windows-x64-portable.zip"
+
+          New-Item -ItemType Directory -Path $distDirectory -Force | Out-Null
+          New-Item -ItemType Directory -Path $stageDirectory -Force | Out-Null
+          Copy-Item -LiteralPath 'target\release\ms-audio-dock-remapper.exe' -Destination (Join-Path $stageDirectory 'MS Audio Dock Remapper.exe')
+          Copy-Item -LiteralPath 'README.md' -Destination $stageDirectory
+          Copy-Item -LiteralPath 'README_CN.md' -Destination $stageDirectory
+          Copy-Item -LiteralPath 'LICENSE' -Destination $stageDirectory
+          Compress-Archive -Path (Join-Path $stageDirectory '*') -DestinationPath $portablePath -CompressionLevel Optimal
+
+          "path=$portablePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build installer
+        id: installer
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          $compilerPath = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $installerPath = Join-Path $env:GITHUB_WORKSPACE "dist\MS-Audio-Dock-Remapper-$tag-windows-x64-installer.exe"
+
+          if (-not (Test-Path -LiteralPath $compilerPath)) {
+            throw "Inno Setup compiler was not found at $compilerPath"
+          }
+
+          & $compilerPath "/DMyAppVersion=$tag" 'installer\ms-audio-dock-remapper.iss'
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if (-not (Test-Path -LiteralPath $installerPath)) {
+            throw "Installer was not created at $installerPath"
+          }
+
+          "path=$installerPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Generate checksums
+        id: checksums
+        shell: pwsh
+        env:
+          PORTABLE_PATH: ${{ steps.portable.outputs.path }}
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          $checksumPath = Join-Path $env:GITHUB_WORKSPACE "dist\SHA256SUMS-$tag.txt"
+          $assets = @($env:PORTABLE_PATH, $env:INSTALLER_PATH)
+
+          $checksumLines = $assets | ForEach-Object {
+            $fileName = Split-Path -Leaf $_
+            $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $fileName"
+          }
+          $checksumLines | Set-Content -LiteralPath $checksumPath -Encoding ascii
+
+          "path=$checksumPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          PORTABLE_PATH: ${{ steps.portable.outputs.path }}
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+          CHECKSUM_PATH: ${{ steps.checksums.outputs.path }}
+        run: |
+          gh release create $env:RELEASE_TAG `
+            $env:PORTABLE_PATH `
+            $env:INSTALLER_PATH `
+            $env:CHECKSUM_PATH `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title $env:RELEASE_TAG `
+            --generate-notes
