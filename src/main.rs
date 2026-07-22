@@ -9,7 +9,6 @@ mod platform;
 mod presets;
 mod ui;
 
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 fn main() {
@@ -27,11 +26,8 @@ fn main() {
         return;
     }
 
-    let (tx, rx) = mpsc::channel();
-
-    // OS-specific resident monitor (raw input + tray). Runs its own thread.
-    platform::start_monitor(tx, config.clone());
-
-    // Slint UI event loop (blocks until quit).
-    ui::run(config, rx, lang);
+    // Slint UI event loop (blocks until quit). The UI wires up the OS-specific
+    // resident monitor (raw input + tray) itself, forwarding events into the
+    // Slint event loop so the app stays event-driven (no busy polling).
+    ui::run(config, lang);
 }

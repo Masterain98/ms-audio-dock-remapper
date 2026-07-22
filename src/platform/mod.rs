@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
@@ -71,12 +70,20 @@ pub enum MonitorEvent {
 }
 
 /// Starts the OS-specific resident monitor (raw-input listening + tray).
+///
+/// Instead of a channel sender, callers pass `on_event`: a `Send` callback the
+/// monitor invokes on every `MonitorEvent`. The UI layer typically forwards each
+/// event into the Slint event loop with `slint::invoke_from_event_loop` so the
+/// app stays event-driven and the UI thread can idle (no periodic polling).
 /// Implementations live in `windows.rs` / `stub.rs`, selected by cfg.
-pub fn start_monitor(tx: Sender<MonitorEvent>, config: Arc<Mutex<Config>>) {
+pub fn start_monitor(
+    on_event: impl Fn(MonitorEvent) + Send + 'static,
+    config: Arc<Mutex<Config>>,
+) {
     #[cfg(windows)]
-    crate::platform::windows::start_monitor(tx, config);
+    crate::platform::windows::start_monitor(on_event, config);
     #[cfg(not(windows))]
-    crate::platform::stub::start_monitor(tx, config);
+    crate::platform::stub::start_monitor(on_event, config);
 }
 
 /// Shows a modal alert (Windows MessageBox; otherwise stderr). Used for fatal

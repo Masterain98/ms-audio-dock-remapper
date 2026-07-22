@@ -1,10 +1,13 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use slint::{CloseRequestResponse, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
+use slint::{
+    invoke_from_event_loop, CloseRequestResponse, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode,
+    VecModel, Weak,
+};
 
 use crate::actions;
 use crate::autostart;
@@ -316,6 +319,11 @@ slint::slint! {
         in-out property <string> collections-text: "—";
         in-out property <string> presses-text: "0";
         in-out property <string> last-text: "—";
+        // Raw running counters, kept on the component so event handling stays
+        // event-driven (no Rust-side shared state captured into a `Send`
+        // closure). `presses-text`/`status-text`/etc. stay the display strings.
+        in-out property <int> presses-count: 0;
+        in-out property <int> status-count: 0;
         in-out property <int> action-index: 0;
         in-out property <[AppChoice]> action-model;
         in-out property <string> action-filter: "";
@@ -558,14 +566,11 @@ slint::slint! {
 
 }
 
-/// Mutable UI state shared across callbacks (press counter, last status, etc.).
-struct UiState {
-    presses: usize,
-    status: u32,
-    last: String,
-}
-
-pub fn run(config: Arc<Mutex<Config>>, rx: Receiver<MonitorEvent>, initial_lang: Lang) {
+/// Running counters (press count, device status, last trigger time) live in
+/// Slint `int`/`string` properties so the event handler can stay fully
+/// event-driven and avoid capturing any `!Send` Rust state into the `Send`
+/// closure passed to `slint::invoke_from_event_loop`.
+pub fn run(config: Arc<Mutex<Config>>, initial_lang: Lang) {
     // Fix CJK tofu globally (must happen before the first Slint window, which
     // is when the font collection is created).
     set_default_cjk_font();
@@ -621,11 +626,6 @@ pub fn run(config: Arc<Mutex<Config>>, rx: Receiver<MonitorEvent>, initial_lang:
     }
 
     let lang = Rc::new(Cell::new(initial_lang));
-    let state = Rc::new(RefCell::new(UiState {
-        presses: 0,
-        status: 0,
-        last: String::new(),
-    }));
     let feedback_timer = Rc::new(Timer::default());
 
     // Seed control values from the persisted config.
@@ -652,7 +652,7 @@ pub fn run(config: Arc<Mutex<Config>>, rx: Receiver<MonitorEvent>, initial_lang:
         ui.set_minimize(c.settings.minimize_to_tray);
     }
 
-    select_language(&ui, &lang, &state, &config, &apps, initial_lang);
+    select_language(&ui, &lang, &config, &apps, initial_lang);
 
     // --- live application-name filtering -----------------------------------
     {
@@ -691,13 +691,12 @@ pub fn run(config: Arc<Mutex<Config>>, rx: Receiver<MonitorEvent>, initial_lang:
     {
         let uiw = ui.as_weak();
         let lang2 = lang.clone();
-        let state2 = state.clone();
         let cfg = config.clone();
         let apps2 = apps.clone();
         ui.on_lang_chosen(move |idx| {
             let new_lang = if idx == 0 { Lang::Zh } else { Lang::En };
             if let Some(ui) = uiw.upgrade() {
-                select_language(&ui, &lang2, &state2, &cfg, &apps2, new_lang);
+                select_language(&ui, &lang2, &cfg, &apps2, new_lang);
             }
         });
     }
@@ -781,58 +780,50 @@ pub fn run(config: Arc<Mutex<Config>>, rx: Receiver<MonitorEvent>, initial_lang:
         });
     }
 
-    // --- drain monitor events on the UI thread ---
+    // --- deliver monitor events to the UI thread, event-driven ---------------
+    // The resident monitor invokes `on_event` on its own thread for every
+    // `MonitorEvent`. We buffer the event in an `mpsc` channel (so nothing is
+    // lost if the Slint event loop is not ready yet — `invoke_from_event_loop`
+    // returns `Err` before the loop starts) and then ask the Slint event loop
+    // to drain the channel on the UI thread via `invoke_from_event_loop`.
+    //
+    // This replaces the old 200 ms `Timer::Repeated` poll: with no active timer,
+    // the winit event loop can block in its message wait and the UI thread idles
+    // at ~0% CPU when nothing happens.
+    let (tx, rx) = mpsc::channel::<MonitorEvent>();
+    let rx = Arc::new(Mutex::new(rx));
     let ui_weak = ui.as_weak();
-    let lang_cell = lang.clone();
-    let state_cell = state.clone();
-    let timer = Timer::default();
-    timer.start(TimerMode::Repeated, Duration::from_millis(200), move || {
-        while let Ok(ev) = rx.try_recv() {
-            match ev {
-                MonitorEvent::Press => {
-                    let (presses, last) = {
-                        let mut s = state_cell.borrow_mut();
-                        s.presses += 1;
-                        s.last = now_hms();
-                        (s.presses, s.last.clone())
-                    };
-                    let l = lang_cell.get();
-                    if let Some(ui) = ui_weak.upgrade() {
-                        ui.set_presses_text(format!("{}{}", i18n::t(l, "presses"), presses).into());
-                        ui.set_last_text(format!("{}{}", i18n::t(l, "last"), last).into());
-                    }
-                }
-                MonitorEvent::Status(n) => {
-                    state_cell.borrow_mut().status = n;
-                    let l = lang_cell.get();
-                    if let Some(ui) = ui_weak.upgrade() {
-                        let status = if n > 0 {
-                            format!(
-                                "{}{}",
-                                i18n::t(l, "status_prefix"),
-                                i18n::t(l, "status_connected")
-                            )
-                        } else {
-                            format!(
-                                "{}{}",
-                                i18n::t(l, "status_prefix"),
-                                i18n::t(l, "status_disconnected")
-                            )
-                        };
-                        ui.set_status_text(status.into());
-                        ui.set_collections_text(
-                            format!("{}{}", i18n::t(l, "collections"), n).into(),
-                        );
-                    }
-                }
-                MonitorEvent::TrayShow => {
-                    if let Some(ui) = ui_weak.upgrade() {
-                        let _ = ui.show();
-                    }
-                }
-            }
+    let on_event = {
+        let tx = tx;
+        let rx = rx.clone();
+        let ui_weak = ui_weak.clone();
+        let config = config.clone();
+        move |ev: MonitorEvent| {
+            // Buffer first so the event survives a not-yet-running loop.
+            let _ = tx.send(ev);
+            let rx = rx.clone();
+            let ui_weak = ui_weak.clone();
+            let config = config.clone();
+            let _ = invoke_from_event_loop(move || {
+                pump_events(&rx, &ui_weak, &config);
+            });
         }
-    });
+    };
+    platform::start_monitor(on_event, config.clone());
+
+    // Flush any events that arrived before the event loop was ready (notably the
+    // monitor's initial device-status broadcast sent during startup). A one-shot
+    // timer fires exactly once after the loop starts and then disarms, so it does
+    // not keep the loop awake the way the old repeating timer did.
+    {
+        let rx = rx.clone();
+        let ui_weak = ui_weak.clone();
+        let config = config.clone();
+        let flush = Timer::default();
+        flush.start(TimerMode::SingleShot, Duration::from_millis(0), move || {
+            pump_events(&rx, &ui_weak, &config);
+        });
+    }
 
     // Run the event loop "until quit": hiding the window (minimize-to-tray)
     // must NOT terminate the app — our Win32 tray keeps it alive. Only an
@@ -846,7 +837,6 @@ pub fn run(config: Arc<Mutex<Config>>, rx: Receiver<MonitorEvent>, initial_lang:
 fn select_language(
     ui: &AppWindow,
     lang: &Rc<Cell<Lang>>,
-    state: &Rc<RefCell<UiState>>,
     config: &Arc<Mutex<Config>>,
     apps: &[crate::installed_apps::InstalledApp],
     new_lang: Lang,
@@ -857,22 +847,23 @@ fn select_language(
         c.language = new_lang.code().to_string();
         let _ = c.save();
     }
-    relocalize(ui, new_lang, &state.borrow(), apps);
+    relocalize(ui, new_lang, apps);
     ui.set_lang_index(if new_lang == Lang::Zh { 0 } else { 1 });
 }
 
 /// Re-applies every localized string + the application picker and language menu
-/// models for `lang`.
+/// models for `lang`. Running counters are read back from the Slint properties
+/// (`presses-count`, `status-count`, `last-text`) so a language switch repaints
+/// them without needing any Rust-side shared state.
 fn relocalize(
     ui: &AppWindow,
     lang: Lang,
-    state: &UiState,
     apps: &[crate::installed_apps::InstalledApp],
 ) {
     ui.set_window_title(i18n::t(lang, "app_title").into());
     ui.set_subtitle_text(i18n::t(lang, "subtitle").into());
 
-    let status = if state.status > 0 {
+    let status = if ui.get_status_count() > 0 {
         format!(
             "{}{}",
             i18n::t(lang, "status_prefix"),
@@ -886,9 +877,13 @@ fn relocalize(
         )
     };
     ui.set_status_text(status.into());
-    ui.set_collections_text(format!("{}{}", i18n::t(lang, "collections"), state.status).into());
-    ui.set_presses_text(format!("{}{}", i18n::t(lang, "presses"), state.presses).into());
-    ui.set_last_text(format!("{}{}", i18n::t(lang, "last"), state.last).into());
+    ui.set_collections_text(
+        format!("{}{}", i18n::t(lang, "collections"), ui.get_status_count()).into(),
+    );
+    ui.set_presses_text(
+        format!("{}{}", i18n::t(lang, "presses"), ui.get_presses_count()).into(),
+    );
+    ui.set_last_text(ui.get_last_text());
 
     ui.set_action_label(i18n::t(lang, "action_label").into());
     ui.set_action_filter("".into());
@@ -1045,6 +1040,71 @@ fn set_default_cjk_font() {
 
 fn now_hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// Drains every buffered `MonitorEvent` and applies it on the UI thread. Called
+/// from `slint::invoke_from_event_loop` (per event) and once from a one-shot
+/// timer (to flush events that arrived before the loop was ready). All state it
+/// touches is `Send` (a `Weak<AppWindow>`, an `Arc<Mutex<Receiver>>` buffer, and
+/// `Arc<Mutex<Config>>`), so this is safe to run inside the `Send` closure.
+fn pump_events(
+    rx: &Arc<Mutex<Receiver<MonitorEvent>>>,
+    ui_weak: &Weak<AppWindow>,
+    config: &Arc<Mutex<Config>>,
+) {
+    let Some(ui) = ui_weak.upgrade() else {
+        return;
+    };
+    loop {
+        let ev = match rx.lock().unwrap().try_recv() {
+            Ok(ev) => ev,
+            Err(_) => break,
+        };
+        apply_event(&ui, config, ev);
+    }
+}
+
+/// Applies a single `MonitorEvent` to the UI. Running counters live in Slint
+/// `int`/`string` properties so this function needs no `!Send` Rust state.
+fn apply_event(ui: &AppWindow, config: &Arc<Mutex<Config>>, ev: MonitorEvent) {
+    let lang = ui_lang(config);
+    match ev {
+        MonitorEvent::Press => {
+            let n = ui.get_presses_count() + 1;
+            ui.set_presses_count(n);
+            ui.set_presses_text(format!("{}{}", i18n::t(lang, "presses"), n).into());
+            let last = now_hms();
+            ui.set_last_text(format!("{}{}", i18n::t(lang, "last"), last).into());
+        }
+        MonitorEvent::Status(n) => {
+            ui.set_status_count(n as i32);
+            let status = if n > 0 {
+                format!(
+                    "{}{}",
+                    i18n::t(lang, "status_prefix"),
+                    i18n::t(lang, "status_connected")
+                )
+            } else {
+                format!(
+                    "{}{}",
+                    i18n::t(lang, "status_prefix"),
+                    i18n::t(lang, "status_disconnected")
+                )
+            };
+            ui.set_status_text(status.into());
+            ui.set_collections_text(format!("{}{}", i18n::t(lang, "collections"), n).into());
+        }
+        MonitorEvent::TrayShow => {
+            let _ = ui.show();
+        }
+    }
+}
+
+/// Resolves the active UI language from the persisted config (single source of
+/// truth), used by the event handler so it does not need to capture the
+/// UI-thread-only `Rc<Cell<Lang>>`.
+fn ui_lang(config: &Arc<Mutex<Config>>) -> Lang {
+    Lang::resolve(&config.lock().unwrap().language)
 }
 
 #[cfg(test)]

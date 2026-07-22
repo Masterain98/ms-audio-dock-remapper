@@ -13,6 +13,11 @@ use std::ptr;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
+/// Callback the resident monitor invokes for each `MonitorEvent`. Defined by the
+/// UI layer (it forwards into the Slint event loop). `Send + 'static` so the
+/// monitor can own and call it from its own OS thread.
+type OnEvent = Box<dyn Fn(MonitorEvent) + Send + 'static>;
+
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{HidP_GetCaps, HIDP_CAPS};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
@@ -73,7 +78,7 @@ struct DeviceInfo {
 }
 
 struct Ctx {
-    tx: Sender<MonitorEvent>,
+    on_event: OnEvent,
     config: Arc<Mutex<Config>>,
     /// Shell activation runs on this worker, never inside the Raw Input wndproc.
     action_tx: Sender<Config>,
@@ -81,9 +86,9 @@ struct Ctx {
 }
 
 // --- public API ------------------------------------------------------------
-pub fn start_monitor(tx: Sender<MonitorEvent>, config: Arc<Mutex<Config>>) {
+pub fn start_monitor(on_event: impl Fn(MonitorEvent) + Send + 'static, config: Arc<Mutex<Config>>) {
     let handle = std::thread::spawn(move || unsafe {
-        run(tx, config);
+        run(Box::new(on_event), config);
     });
     *MONITOR_JOIN.lock().unwrap() = Some(handle);
 }
@@ -203,7 +208,7 @@ pub fn autostart_enabled() -> bool {
 }
 
 // --- monitor loop ----------------------------------------------------------
-unsafe fn run(tx: Sender<MonitorEvent>, config: Arc<Mutex<Config>>) {
+unsafe fn run(on_event: OnEvent, config: Arc<Mutex<Config>>) {
     *MONITOR_TID.lock().unwrap() = Some(GetCurrentThreadId());
 
     let class_name = wide("MsAudioDockRemapperCls");
@@ -248,7 +253,7 @@ unsafe fn run(tx: Sender<MonitorEvent>, config: Arc<Mutex<Config>>) {
     });
 
     let ctx = Box::new(Ctx {
-        tx,
+        on_event,
         config,
         action_tx,
         devices: RefCell::new(HashMap::new()),
@@ -322,7 +327,7 @@ unsafe fn handle_raw_input(ctx: &mut Ctx, hrawinput: HRAWINPUT) {
     for r in &reports {
         if let Some(is_release) = match_teams(&dev, r, &cfg.device) {
             if !is_release {
-                let _ = ctx.tx.send(MonitorEvent::Press);
+                (ctx.on_event)(MonitorEvent::Press);
                 if cfg.settings.enabled {
                     let _ = ctx.action_tx.send(cfg.clone());
                 }
@@ -402,6 +407,26 @@ unsafe fn rebuild(hwnd: HWND) {
     let ctx = &mut *raw;
 
     let devices = enumerate();
+
+    // Only (re)register with Raw Input when the actual device set changed.
+    //
+    // `RegisterRawInputDevices` with `RIDEV_DEVNOTIFY` makes Windows immediately
+    // post a `WM_INPUT_DEVICE_CHANGE` (GIDC_ARRIVAL) back to this window to signal
+    // that the device is now subscribed. If we re-registered on *every*
+    // device-change notification, that self-notification would re-enter `rebuild`
+    // and re-register again, forever — a tight loop of ~thousands of empty
+    // re-registrations per second that pinned the UI thread even while idle.
+    // Comparing the HANDLE set against what we already have breaks the cycle:
+    // the first registration's echo is a no-op, while real hot-plug arrivals /
+    // removals still change the set and trigger a real re-register.
+    let changed = {
+        let map = ctx.devices.borrow();
+        map.len() != devices.len()
+            || devices
+                .iter()
+                .any(|d| !map.contains_key(&d.hdevice))
+    };
+
     {
         let mut map = ctx.devices.borrow_mut();
         map.clear();
@@ -410,17 +435,17 @@ unsafe fn rebuild(hwnd: HWND) {
         }
     }
 
-    let regs: Vec<RAWINPUTDEVICE> = devices
-        .iter()
-        .map(|d| RAWINPUTDEVICE {
-            usUsagePage: d.usage_page,
-            usUsage: d.usage,
-            dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
-            hwndTarget: hwnd,
-        })
-        .collect();
+    if changed && !devices.is_empty() {
+        let regs: Vec<RAWINPUTDEVICE> = devices
+            .iter()
+            .map(|d| RAWINPUTDEVICE {
+                usUsagePage: d.usage_page,
+                usUsage: d.usage,
+                dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
+                hwndTarget: hwnd,
+            })
+            .collect();
 
-    if !regs.is_empty() {
         RegisterRawInputDevices(
             regs.as_ptr(),
             regs.len() as u32,
@@ -428,7 +453,7 @@ unsafe fn rebuild(hwnd: HWND) {
         );
     }
 
-    let _ = ctx.tx.send(MonitorEvent::Status(devices.len() as u32));
+    (ctx.on_event)(MonitorEvent::Status(devices.len() as u32));
 }
 
 unsafe fn enumerate() -> Vec<DeviceInfo> {
@@ -647,7 +672,7 @@ unsafe fn refresh_notification_area() {
 
 unsafe fn handle_tray(ctx: &mut Ctx, msg: u32) {
     if msg == WM_LBUTTONDBLCLK {
-        let _ = ctx.tx.send(MonitorEvent::TrayShow);
+        (ctx.on_event)(MonitorEvent::TrayShow);
     }
 }
 
