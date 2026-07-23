@@ -421,10 +421,7 @@ unsafe fn rebuild(hwnd: HWND) {
     // removals still change the set and trigger a real re-register.
     let changed = {
         let map = ctx.devices.borrow();
-        map.len() != devices.len()
-            || devices
-                .iter()
-                .any(|d| !map.contains_key(&d.hdevice))
+        map.len() != devices.len() || devices.iter().any(|d| !map.contains_key(&d.hdevice))
     };
 
     {

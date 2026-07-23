@@ -855,11 +855,7 @@ fn select_language(
 /// models for `lang`. Running counters are read back from the Slint properties
 /// (`presses-count`, `status-count`, `last-text`) so a language switch repaints
 /// them without needing any Rust-side shared state.
-fn relocalize(
-    ui: &AppWindow,
-    lang: Lang,
-    apps: &[crate::installed_apps::InstalledApp],
-) {
+fn relocalize(ui: &AppWindow, lang: Lang, apps: &[crate::installed_apps::InstalledApp]) {
     ui.set_window_title(i18n::t(lang, "app_title").into());
     ui.set_subtitle_text(i18n::t(lang, "subtitle").into());
 
@@ -880,9 +876,7 @@ fn relocalize(
     ui.set_collections_text(
         format!("{}{}", i18n::t(lang, "collections"), ui.get_status_count()).into(),
     );
-    ui.set_presses_text(
-        format!("{}{}", i18n::t(lang, "presses"), ui.get_presses_count()).into(),
-    );
+    ui.set_presses_text(format!("{}{}", i18n::t(lang, "presses"), ui.get_presses_count()).into());
     ui.set_last_text(ui.get_last_text());
 
     ui.set_action_label(i18n::t(lang, "action_label").into());

@@ -76,10 +76,7 @@ pub enum MonitorEvent {
 /// event into the Slint event loop with `slint::invoke_from_event_loop` so the
 /// app stays event-driven and the UI thread can idle (no periodic polling).
 /// Implementations live in `windows.rs` / `stub.rs`, selected by cfg.
-pub fn start_monitor(
-    on_event: impl Fn(MonitorEvent) + Send + 'static,
-    config: Arc<Mutex<Config>>,
-) {
+pub fn start_monitor(on_event: impl Fn(MonitorEvent) + Send + 'static, config: Arc<Mutex<Config>>) {
     #[cfg(windows)]
     crate::platform::windows::start_monitor(on_event, config);
     #[cfg(not(windows))]
