@@ -570,7 +570,11 @@ slint::slint! {
 /// Slint `int`/`string` properties so the event handler can stay fully
 /// event-driven and avoid capturing any `!Send` Rust state into the `Send`
 /// closure passed to `slint::invoke_from_event_loop`.
-pub fn run(config: Arc<Mutex<Config>>, initial_lang: Lang) {
+///
+/// `start_minimized` comes from `main` (persisted setting or the `--minimized`
+/// switch on the login entry) and decides whether the settings window is shown
+/// at all; the resident monitor and the tray icon start either way.
+pub fn run(config: Arc<Mutex<Config>>, initial_lang: Lang, start_minimized: bool) {
     // Fix CJK tofu globally (must happen before the first Slint window, which
     // is when the font collection is created).
     set_default_cjk_font();
@@ -729,15 +733,18 @@ pub fn run(config: Arc<Mutex<Config>>, initial_lang: Lang) {
                 c.action.command.clear();
                 c.action.arguments.clear();
             }
+            let start_win = ui.get_start_windows();
+            let start_minimized = ui.get_minimize();
             c.settings.enabled = ui.get_enabled();
             c.settings.play_confirmation_beep = ui.get_confirm_beep();
-            c.settings.minimize_to_tray = ui.get_minimize();
-            let start_win = ui.get_start_windows();
+            c.settings.minimize_to_tray = start_minimized;
             c.settings.start_with_windows = start_win;
             c.language = lang2.get().code().to_string();
             drop(c);
 
-            autostart::set_enabled(start_win);
+            // The login entry carries `--minimized` too, so a silent start does
+            // not depend on the config file being readable at sign-in.
+            autostart::set_enabled(start_win, start_minimized);
             match cfg.lock().unwrap().save() {
                 Ok(_) => show_feedback(&ui, &ft, i18n::t(lang2.get(), "saved")),
                 Err(e) => platform::alert(&format!("{} {e}", i18n::t(lang2.get(), "save_fail"))),
@@ -828,8 +835,67 @@ pub fn run(config: Arc<Mutex<Config>>, initial_lang: Lang) {
     // Run the event loop "until quit": hiding the window (minimize-to-tray)
     // must NOT terminate the app — our Win32 tray keeps it alive. Only an
     // explicit menu-bar Exit ends the loop.
-    ui.window().show().ok();
-    slint::run_event_loop_until_quit().ok();
+    //
+    // With "start minimized to the tray" the window is never shown in the first
+    // place. The monitor and the tray icon are already up by now, so the app
+    // comes up resident-only and the user opens the settings window by
+    // double-clicking the tray icon. `run_event_loop_until_quit` is documented
+    // for exactly this daemon-style case (keeps running with nothing visible).
+    let outcome = if start_minimized {
+        slint::run_event_loop_until_quit()
+    } else {
+        ui.window()
+            .show()
+            .and_then(|()| slint::run_event_loop_until_quit())
+    };
+    if let Err(error) = outcome {
+        handle_backend_failure(&error, ui_lang(&config));
+    }
+}
+
+/// Slint's default renderer needs a working OpenGL driver. Machines without one
+/// (remote-desktop sessions, VMs, very old GPUs) fail *inside* `show()` /
+/// `run_event_loop_until_quit`, which used to be swallowed with `.ok()` — the
+/// process then returned from `main` with exit code 0 and, having no console,
+/// simply vanished with no explanation at all.
+///
+/// The software renderer is compiled in, so try to recover by re-running
+/// ourselves with it forced on, and only report the failure when that is not an
+/// option any more.
+fn handle_backend_failure(error: &slint::PlatformError, lang: Lang) {
+    if relaunch_with_software_renderer() {
+        return;
+    }
+    platform::alert(&format!("{} {error}", i18n::t(lang, "render_fail")));
+}
+
+/// The Slint backend/renderer combination that needs no GPU driver.
+const SOFTWARE_BACKEND: &str = "winit-software";
+
+/// Re-executes this process with the software renderer forced on, handing over
+/// the tray icon and the single-instance slot first.
+///
+/// Returns false — meaning "report the error instead" — when a backend was
+/// already pinned (so a still-broken relaunch can never loop) or when the
+/// replacement process could not be started.
+fn relaunch_with_software_renderer() -> bool {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    // Stop the monitor thread first: it removes its tray icon and destroys its
+    // window before returning, so the replacement process does not end up
+    // sitting next to a dead icon. Then drop the single-instance mutex, or the
+    // replacement would report itself as "already running".
+    platform::request_quit();
+    platform::release_single_instance();
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("SLINT_BACKEND", SOFTWARE_BACKEND)
+        .spawn()
+        .is_ok()
 }
 
 /// Applies `new_lang` everywhere: persists the choice and re-localizes all

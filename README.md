@@ -94,6 +94,14 @@ You can also enable:
 - **Play confirmation sound on trigger**
 - **Enable key remapping**
 
+With **Start minimized to the tray** enabled the application starts tray-only:
+the settings window is not shown at all, while key monitoring runs as usual.
+Double-click the tray icon to open the window. Combined with **Launch at Windows
+sign-in** this gives a silent background start after boot — the sign-in entry is
+registered as `"…\ms-audio-dock-remapper.exe" --minimized`, so the silent start
+also holds when the configuration file cannot be read. You can pass
+`--minimized` to a shortcut of your own for the same effect.
+
 Only one instance of the application can run at a time.
 
 ## Configuration

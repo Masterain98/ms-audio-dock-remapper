@@ -101,6 +101,7 @@ pub fn t(lang: Lang, key: &str) -> &str {
         ("test_ok", "测试动作已执行"),
         ("single_instance", "MsAudioDock Remapper 已在运行。"),
         ("init_fail", "无法创建监听窗口（Raw Input 初始化失败）。"),
+        ("render_fail", "无法初始化图形后端，应用无法显示界面："),
         ("save_fail", "保存配置失败："),
         ("action_fail", "动作执行失败："),
         ("test_fail", "测试动作失败："),
@@ -162,6 +163,10 @@ pub fn t(lang: Lang, key: &str) -> &str {
         (
             "init_fail",
             "Failed to create the listener window (Raw Input init failed).",
+        ),
+        (
+            "render_fail",
+            "Failed to initialize the graphics backend, the user interface cannot be shown:",
         ),
         ("save_fail", "Failed to save config: "),
         ("action_fail", "Action failed: "),

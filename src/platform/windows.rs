@@ -65,6 +65,11 @@ static MONITOR_TID: Mutex<Option<u32>> = Mutex::new(None);
 /// destroyed its window (otherwise a "ghost" tray icon lingers until hover).
 static MONITOR_JOIN: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
+/// The single-instance mutex, held for the whole process lifetime. Kept around
+/// (rather than leaked) only so `release_single_instance` can hand the slot over
+/// to a replacement process; see the software-renderer fallback in `ui`.
+static INSTANCE_MUTEX: Mutex<Option<HANDLE>> = Mutex::new(None);
+
 // --- types -----------------------------------------------------------------
 #[derive(Clone)]
 struct DeviceInfo {
@@ -105,8 +110,25 @@ pub fn ensure_single_instance() -> bool {
             let _ = CloseHandle(h);
             return false;
         }
+        *INSTANCE_MUTEX.lock().unwrap() = Some(h);
     }
     true
+}
+
+/// Gives up the single-instance slot so a process started right afterwards can
+/// claim it. Used only when the app deliberately re-executes itself (the
+/// software-renderer fallback); a normal exit closes the handle anyway.
+///
+/// Must run on the thread that created the mutex — it owns it — which is the
+/// main thread in both cases.
+pub fn release_single_instance() {
+    let handle = INSTANCE_MUTEX.lock().unwrap().take();
+    if let Some(h) = handle {
+        unsafe {
+            let _ = ReleaseMutex(h);
+            let _ = CloseHandle(h);
+        }
+    }
 }
 
 pub fn alert(message: &str) {
@@ -155,7 +177,10 @@ pub fn set_dpi_aware() {
     }
 }
 
-pub fn set_autostart(enable: bool) {
+/// Writes (or removes) the HKCU Run entry. When `start_minimized` is set the
+/// registered command line carries `--minimized`, so the sign-in launch comes up
+/// tray-only even if the config file cannot be read at that point.
+pub fn set_autostart(enable: bool, start_minimized: bool) {
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     let value = wide("MsAudioDockRemapper");
     unsafe {
@@ -167,7 +192,11 @@ pub fn set_autostart(enable: bool) {
             let exe = std::env::current_exe()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let data = format!("\"{exe}\"");
+            let data = if start_minimized {
+                format!("\"{exe}\" {}", crate::autostart::MINIMIZED_FLAG)
+            } else {
+                format!("\"{exe}\"")
+            };
             let wdata = wide(&data);
             RegSetValueExW(
                 hkey,

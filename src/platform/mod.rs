@@ -106,6 +106,14 @@ pub fn request_quit() {
     }
 }
 
+/// Gives up the single-instance lock so a process started right afterwards can
+/// claim it. Only used when the app deliberately re-executes itself (the
+/// software-renderer fallback in `ui`); a normal exit releases it anyway.
+pub fn release_single_instance() {
+    #[cfg(windows)]
+    crate::platform::windows::release_single_instance();
+}
+
 /// Declares the process DPI-aware so windows render crisply on high-DPI
 /// displays (notably the "already running" MessageBox shown before the UI loop).
 pub fn set_dpi_aware() {
